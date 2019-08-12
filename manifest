@@ -1,0 +1,15 @@
+d usr 0755 root sys
+d usr/kernel 0755 root sys
+d usr/kernel/drv 0755 root sys
+d usr/kernel/drv/amd64 0755 root sys
+f usr/kernel/drv/amd64/mfii 0755 root sys
+f usr/kernel/drv/mfii.conf 0644 root sys
+d kernel 0755 root sys
+d kernel/drv 0755 root sys
+d kernel/drv/amd64 0755 root sys
+f kernel/drv/amd64/mfii 0755 root sys
+f kernel/drv/mfii.conf 0644 root sys
+d etc 0755 root sys
+f etc/driver_aliases 0644 root sys
+f etc/driver_classes 0644 root sys
+f etc/name_to_major 0644 root sys
