@@ -117,9 +117,9 @@ struct mfii_ccb {
 				    struct mfii_ccb *);
 
 	uint_t			ccb_smid;
-	SIMPLEQ_ENTRY(mfii_ccb)	ccb_entry;
+	TAILQ_ENTRY(mfii_ccb)	ccb_entry;
 };
-SIMPLEQ_HEAD(mfii_ccb_list, mfii_ccb);
+TAILQ_HEAD(mfii_ccb_list, mfii_ccb);
 
 struct mfii_pkt {
 	struct mfii_ccb		*mp_ccb;
@@ -152,7 +152,6 @@ struct mfii_pd_lu {
 
 struct mfii_softc {
 	dev_info_t		*sc_dev;
-	ddi_iblock_cookie_t	sc_iblock_cookie;
 
 	const struct mfii_iop	*sc_iop;
 
@@ -169,6 +168,11 @@ struct mfii_softc {
 
 	ddi_dma_attr_t		sc_io_dma_attr;
 
+	ddi_intr_handle_t	sc_intrs[1];
+	int			sc_nintrs;
+	int			sc_intr_type;
+	uint_t			sc_intr_pri;
+
 	uint_t			sc_reply_postq_depth;
 	uint_t			sc_reply_postq_index;
 	struct mfii_dmamem	*sc_reply_postq;
@@ -177,9 +181,14 @@ struct mfii_softc {
 	struct mfii_dmamem	*sc_sense;
 	struct mfii_dmamem	*sc_sgl;
 
+	/* array of all possible ccbs (allocated at attach) */
 	struct mfii_ccb		*sc_ccbs;
-	struct mfii_ccb_list	sc_ccb_list;
+	/* tailqs of the free and busy ccbs */
+	struct mfii_ccb_list	sc_ccb_free;
+	struct mfii_ccb_list	sc_ccb_busy;
+
 	kmutex_t		sc_ccb_mtx;
+	/* things waiting on a free ccb */
 	TAILQ_HEAD(, mfii_ccb_sleep)
 				sc_ccb_sleepers;
 
@@ -198,9 +207,14 @@ struct mfii_softc {
 	struct mfii_ccb		*sc_aen_ccb;
 
 	struct mfi_ctrl_info	sc_info;
+
+	/* debug counters */
+	uint64_t		sc_reply_race;
+	uint64_t		sc_no_rpi_intr;
+	uint64_t		sc_intrs_recvd;
 };
 
-static uint_t		mfii_intr(caddr_t);
+static uint_t		mfii_intr(caddr_t, caddr_t);
 
 #define mfii_read(_s, _r) ddi_get32((_s)->sc_reg_space, \
     (uint32_t *)((_s)->sc_reg_baseaddr + (_r)))
@@ -498,6 +512,74 @@ static ddi_device_acc_attr_t mfii_mem_attr = {
 };
 
 static int
+mfii_intr_alloc(dev_info_t *dip, struct mfii_softc *sc, int type)
+{
+	int nintrs = 0;
+	int navail = 0;
+
+	if (ddi_intr_get_nintrs(dip, type, &nintrs) != DDI_SUCCESS)
+		return (DDI_FAILURE);
+	if (nintrs < 1)
+		return (DDI_FAILURE);
+
+	if (ddi_intr_get_navail(dip, type, &navail) != DDI_SUCCESS)
+		return (DDI_FAILURE);
+	if (navail < 1)
+		return (DDI_FAILURE);
+
+	if (ddi_intr_alloc(dip, sc->sc_intrs, type, 0, 1,
+	    &sc->sc_nintrs, DDI_INTR_ALLOC_STRICT) != DDI_SUCCESS) {
+		return (DDI_FAILURE);
+	}
+
+	sc->sc_intr_type = type;
+	return (DDI_SUCCESS);
+}
+
+static int
+mfii_intr_setup(dev_info_t *dip, struct mfii_softc *sc)
+{
+	int types;
+	int ret;
+	uint_t ipri;
+
+	ret = ddi_intr_get_supported_types(dip, &types);
+	if (ret != DDI_SUCCESS)
+		return (ret);
+
+	if (types & DDI_INTR_TYPE_MSIX) {
+		if (mfii_intr_alloc(dip, sc, DDI_INTR_TYPE_MSIX) ==
+		    DDI_SUCCESS) {
+			goto add_handler;
+		}
+	}
+	if (types & DDI_INTR_TYPE_MSI) {
+		if (mfii_intr_alloc(dip, sc, DDI_INTR_TYPE_MSI) ==
+		    DDI_SUCCESS) {
+			goto add_handler;
+		}
+	}
+	if (types & DDI_INTR_TYPE_FIXED) {
+		if (mfii_intr_alloc(dip, sc, DDI_INTR_TYPE_FIXED) ==
+		    DDI_SUCCESS) {
+			goto add_handler;
+		}
+	}
+	dev_err(dip, CE_WARN, "interrupt allocation failed");
+	return (DDI_FAILURE);
+
+add_handler:
+	if (ddi_intr_get_pri(sc->sc_intrs[0], &ipri) != DDI_SUCCESS) {
+		ddi_intr_free(sc->sc_intrs[0]);
+		return (DDI_FAILURE);
+	}
+	sc->sc_intr_pri = ipri;
+	ret = ddi_intr_add_handler(sc->sc_intrs[0], mfii_intr,
+	    (caddr_t)sc, NULL);
+	return (ret);
+}
+
+static int
 mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 {
 	struct mfii_softc *sc;
@@ -525,7 +607,8 @@ mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	sc = ddi_get_soft_state(mfii_softc_p, instance);
 	sc->sc_dev = dip;
 
-	SIMPLEQ_INIT(&sc->sc_ccb_list);
+	TAILQ_INIT(&sc->sc_ccb_free);
+	TAILQ_INIT(&sc->sc_ccb_busy);
 	TAILQ_INIT(&sc->sc_ptgt_list);
 	TAILQ_INIT(&sc->sc_ccb_sleepers);
 	if (ddi_soft_state_bystr_init(&sc->sc_ptgt_lus,
@@ -551,26 +634,19 @@ mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 		goto free_regs;
 	}
 
-	/* hook up interrupt */
-	if (ddi_intr_hilevel(dip, 0) != 0) {
-		dev_err(dip, CE_WARN, "high level interrupt is not supported");
-		goto free_iqp;
-	}
-
-	if (ddi_get_iblock_cookie(dip, 0,
-	    &sc->sc_iblock_cookie) != DDI_SUCCESS) {
-		dev_err(dip, CE_WARN, "unable to get iblock cookie");
-		goto free_sc;
+	if (mfii_intr_setup(sc->sc_dev, sc) != DDI_SUCCESS) {
+		dev_err(dip, CE_WARN, "unable to establish interrupt");
+		goto free_regs;
 	}
 
 	mutex_init(&sc->sc_iqp_mtx, NULL, MUTEX_DRIVER,
-	    sc->sc_iblock_cookie);
+	    DDI_INTR_PRI(sc->sc_intr_pri));
 	mutex_init(&sc->sc_mfa_mtx, NULL, MUTEX_DRIVER,
-	    sc->sc_iblock_cookie);
+	    DDI_INTR_PRI(sc->sc_intr_pri));
 	mutex_init(&sc->sc_ccb_mtx, NULL, MUTEX_DRIVER,
-	    sc->sc_iblock_cookie);
+	    DDI_INTR_PRI(sc->sc_intr_pri));
 	mutex_init(&sc->sc_ptgt_mtx, NULL, MUTEX_DRIVER,
-	    sc->sc_iblock_cookie);
+	    DDI_INTR_PRI(sc->sc_intr_pri));
 
 	/* disable interrupts */
 	mfii_write(sc, MFI_OMSK, 0xffffffff);
@@ -640,13 +716,12 @@ mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	sc->sc_taskq = ddi_taskq_create(sc->sc_dev, "mfiitq", 1,
 	    TASKQ_DEFAULTPRI, 0);
 	if (sc->sc_taskq == NULL) {
-		cmn_err(CE_NOTE, "unable to create taskq");
+		dev_err(dip, CE_WARN, "unable to create taskq");
 		goto ccb_dtor;
 	}
 
-	if (ddi_add_intr(sc->sc_dev, 0, &sc->sc_iblock_cookie, NULL,
-	    mfii_intr, (caddr_t)sc) != DDI_SUCCESS) {
-		cmn_err(CE_NOTE, "unable to establish interrupt");
+	if (ddi_intr_enable(sc->sc_intrs[0]) != DDI_SUCCESS) {
+		dev_err(dip, CE_WARN, "unable to enable interrupts");
 		goto taskq_dtor;
 	}
 
@@ -657,19 +732,19 @@ mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	if (mfii_fw_info(sc) != 0) {
 		dev_err(dip, CE_WARN,
 		    "unable to retrieve controller information");
-		goto del_intr;
+		goto taskq_dtor;
 	}
 
 	dev_err(dip, CE_NOTE, "\"%s\", firmware %s",
 	    sc->sc_info.mci_product_name, sc->sc_info.mci_package_version);
 
 	if (scsi_hba_iport_register(dip, "v0") != DDI_SUCCESS)
-		goto del_intr;
+		goto taskq_dtor;
 	if (scsi_hba_iport_register(dip, "p0") != DDI_SUCCESS)
-		goto del_intr;
+		goto taskq_dtor;
 
 	if (mfii_hba_attach(sc) != DDI_SUCCESS)
-		goto del_intr;
+		goto taskq_dtor;
 
 	if (mfii_aen_register(sc) != DDI_SUCCESS) {
 		cmn_err(CE_WARN, "unable to registers aen");
@@ -679,8 +754,6 @@ mfii_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
 	return (DDI_SUCCESS);
 hba_detach:
 	mfii_hba_detach(sc);
-del_intr:
-	ddi_remove_intr(sc->sc_dev, 0, sc->sc_iblock_cookie);
 taskq_dtor:
 	ddi_taskq_destroy(sc->sc_taskq);
 ccb_dtor:
@@ -698,8 +771,9 @@ unmutex:
 	mutex_destroy(&sc->sc_ccb_mtx);
 	mutex_destroy(&sc->sc_mfa_mtx);
 	mutex_destroy(&sc->sc_iqp_mtx);
-free_iqp:
 	ddi_regs_map_free(&sc->sc_iqp_space);
+
+	ddi_intr_free(sc->sc_intrs[0]);
 free_regs:
 	ddi_regs_map_free(&sc->sc_reg_space);
 free_lu:
@@ -733,7 +807,6 @@ mfii_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 
 	mfii_hba_detach(sc);
 	ddi_taskq_destroy(sc->sc_taskq);
-	ddi_remove_intr(sc->sc_dev, 0, sc->sc_iblock_cookie);
 	mfii_ccbs_dtor(sc);
 	mfii_dmamem_free(sc, sc->sc_sgl);
 	mfii_dmamem_free(sc, sc->sc_requests);
@@ -744,6 +817,7 @@ mfii_detach(dev_info_t *dip, ddi_detach_cmd_t cmd)
 	mutex_destroy(&sc->sc_mfa_mtx);
 	mutex_destroy(&sc->sc_iqp_mtx);
 	ddi_regs_map_free(&sc->sc_iqp_space);
+	ddi_intr_free(sc->sc_intrs[0]);
 	ddi_regs_map_free(&sc->sc_reg_space);
 	ddi_soft_state_bystr_fini(&sc->sc_ptgt_lus);
 	ddi_soft_state_free(mfii_softc_p, instance);
@@ -895,7 +969,7 @@ mfii_my_intr(struct mfii_softc *sc)
 }
 
 static uint_t
-mfii_intr(caddr_t arg)
+mfii_intr(caddr_t arg, caddr_t arg2)
 {
 	struct mfii_softc *sc = (struct mfii_softc *)arg;
 	struct mpii_reply_descr *postq = MFII_DMA_KVA(sc->sc_reply_postq);
@@ -905,6 +979,8 @@ mfii_intr(caddr_t arg)
 
 	if (!mfii_my_intr(sc))
 		return (DDI_INTR_UNCLAIMED);
+
+	++sc->sc_intrs_recvd;
 
 	ddi_dma_sync(MFII_DMA_HANDLE(sc->sc_reply_postq), 0, 0,
 	    DDI_DMA_SYNC_FORKERNEL);
@@ -919,6 +995,7 @@ mfii_intr(caddr_t arg)
 			 * ioc is still writing to the reply post queue
 			 * race condition - bail!
 			 */
+			++sc->sc_reply_race;
 			break;
 		}
 
@@ -935,8 +1012,11 @@ mfii_intr(caddr_t arg)
 		rpi = 1;
 	}
 
-	if (rpi)
+	if (rpi) {
 		mfii_write(sc, MFII_RPI, sc->sc_reply_postq_index);
+	} else {
+		++sc->sc_no_rpi_intr;
+	}
 
 	return (DDI_INTR_CLAIMED);
 }
@@ -2259,7 +2339,7 @@ mfii_start(struct mfii_softc *sc, struct mfii_ccb *ccb)
 #endif
 }
 
-int
+static int
 mfii_ccbs_ctor(struct mfii_softc *sc)
 {
 	struct mfii_ccb *ccb;
@@ -2294,7 +2374,9 @@ mfii_ccbs_ctor(struct mfii_softc *sc)
 		    ccb->ccb_sgl_offset;
 
 		/* add ccb to queue */
-		mfii_ccb_put(sc, ccb);
+		mutex_enter(&sc->sc_ccb_mtx);
+		TAILQ_INSERT_TAIL(&sc->sc_ccb_free, ccb, ccb_entry);
+		mutex_exit(&sc->sc_ccb_mtx);
 	}
 
 	return (DDI_SUCCESS);
@@ -2320,10 +2402,10 @@ mfii_ccb_get(struct mfii_softc *sc, int sleep)
 	struct mfii_ccb *ccb;
 
 	mutex_enter(&sc->sc_ccb_mtx);
-	ccb = SIMPLEQ_FIRST(&sc->sc_ccb_list);
-	if (ccb != NULL)
-		SIMPLEQ_REMOVE_HEAD(&sc->sc_ccb_list, ccb_entry);
-	else if (sleep == KM_SLEEP) {
+	ccb = TAILQ_FIRST(&sc->sc_ccb_free);
+	if (ccb != NULL) {
+		TAILQ_REMOVE(&sc->sc_ccb_free, ccb, ccb_entry);
+	} else if (sleep == KM_SLEEP) {
 		struct mfii_ccb_sleep s;
 
 		cv_init(&s.s_cv, "mfiiccb", CV_DRIVER, NULL);
@@ -2339,6 +2421,7 @@ mfii_ccb_get(struct mfii_softc *sc, int sleep)
 
 		ccb = s.s_ccb;
 	}
+	TAILQ_INSERT_HEAD(&sc->sc_ccb_busy, ccb, ccb_entry);
 	mutex_exit(&sc->sc_ccb_mtx);
 
 	return (ccb);
@@ -2350,13 +2433,15 @@ mfii_ccb_put(struct mfii_softc *sc, struct mfii_ccb *ccb)
 	struct mfii_ccb_sleep *s;
 
 	mutex_enter(&sc->sc_ccb_mtx);
+	TAILQ_REMOVE(&sc->sc_ccb_busy, ccb, ccb_entry);
 	s = TAILQ_FIRST(&sc->sc_ccb_sleepers);
 	if (s != NULL) {
 		TAILQ_REMOVE(&sc->sc_ccb_sleepers, s, s_entry);
 		s->s_ccb = ccb;
 		cv_signal(&s->s_cv);
-	} else
-		SIMPLEQ_INSERT_HEAD(&sc->sc_ccb_list, ccb, ccb_entry);
+	} else {
+		TAILQ_INSERT_HEAD(&sc->sc_ccb_free, ccb, ccb_entry);
+	}
 	mutex_exit(&sc->sc_ccb_mtx);
 }
 
